@@ -1,6 +1,6 @@
 #include <Arduino.h>
-#include <ModbusMaster.h>
-#include <SoftwareSerial.h>
+// #include <ModbusMaster.h>
+// #include <SoftwareSerial.h>
 #include <avr/power.h>
 #include <avr/sleep.h>
 #include <avr/wdt.h>
@@ -9,14 +9,15 @@
 #define BUTTON_PIN 2           // Input pin for the button
 #define RELAY_PIN 3            // Output pin for the relay
 #define CURRENT_SENSOR_PIN A2  // Input pin for the current sensor (0.2 - 2.8V)
-#define RX_PIN 8               // RX pin for RS485 comm
-#define MAX485_RE 9            // Output pin to enable RS485 communication
-#define MAX485_DE 10           // Output pin to enable RS485 communication
-#define TX_PIN 11              // TX pin for RS485 comm
-#define SLAVE_ID 1             // Modbus slave ID
+#define LIMIT_UP_PIN 8         // Input pin for the upper limit switch
+#define MOVE_UP_PIN 10         // Output pin for moving the lift up
+#define LIMIT_DOWN_PIN 9       // Input pin for the lower limit switch
+#define MOVE_DOWN_PIN 11       // Output pin for moving the lift down
+#define MOVE_STOP_PIN 12       // Output pin for stopping the lift
+#define ONBOARD_LED LED_BUILTIN  // Built-in LED
 
-SoftwareSerial modbus_serial(RX_PIN, TX_PIN);
-ModbusMaster node;
+// SoftwareSerial modbus_serial(RX_PIN, TX_PIN);
+// ModbusMaster node;
 bool is_button_pressed = false;
 unsigned long button_press_duration = 0;
 
@@ -38,19 +39,18 @@ enum class State {
   MOVE_UP,
   STOP,
   IDLE,
-  RESUME
+  RESUME,
+  DEAD
 };
 
 void init_button();
 void init_relay();
 float read_current_sensor_value();
 bool is_projector_on();
-void init_modbus();
-void modbus_pre_tx();
-void modbus_post_tx();
+void init_motor_ctrl();
 void lower_column();
 void raise_column();
-void stop_column();
+void stop_column(MoveDirection moveDirection);
 void disable_psu();
 void enable_psu();
 LiftState get_lift_state();
@@ -63,28 +63,30 @@ const unsigned long PROJECTOR_DEBOUNCE_DELAY = 500u;  // ms
 const unsigned long LIFT_LOWER_DELAY = 15000u;        // ms
 const unsigned long IDLE_TIMEOUT = 60000u;            // ms
 const unsigned long RESUME_TIMEOUT = 100u;            // ms
-const unsigned long MAX_MOVE_TIME = 20000u;           // ms
-const auto CURRENT_SENSOR_AMP_PER_VOLT = 20.0f;       // A/V
-const auto VREF = 3.3f;                               // V
-const auto CURRENT_PROJECTOR_ON = 0.06f;              // A
-const auto CURRENT_HYSTERESIS = 0.03f;                // A
+const unsigned long MAX_MOVE_TIME = 1000u;            // ms
+const unsigned long MAX_PREP_TIME =
+    10000u;  // ms (max time before considering controller is dead)
+const auto CURRENT_SENSOR_AMP_PER_VOLT = 20.0f;  // A/V
+const auto VREF = 3.3f;                          // V
+const auto CURRENT_PROJECTOR_ON = 0.06f;         // A
+const auto CURRENT_HYSTERESIS = 0.03f;           // A
+
+bool last_button_state = false;
 
 void setup() {
   digitalWrite(LED_BUILTIN, LOW);
 
   Serial.begin(115200);
 
-  // configure LED_BUILTIN as an output
-  pinMode(LED_BUILTIN, OUTPUT);
-
+  init_motor_ctrl();
   init_button();
   init_relay();
-  init_modbus();
 }
 
 void loop() {
   static State current_state = State::INIT;
   current_state = run_state_machine(current_state);
+
   delay(1);
 }
 
@@ -118,7 +120,12 @@ State run_state_machine(State current_state) {
           next_state = State::IS_INTERMEDIATE;
           break;
         case LiftState::UNKNOWN:
-          next_state = State::PREP;
+          if (now - last_state_change_time >= MAX_PREP_TIME) {
+            // Controller is dead
+            next_state = State::DEAD;
+          } else {
+            next_state = State::PREP;
+          }
           break;
       }
       break;
@@ -230,6 +237,13 @@ State run_state_machine(State current_state) {
     case State::STOP:
       next_state = State::PREP;
       break;
+
+    case State::DEAD:
+      saved_button_pressed = false;
+      if (button_pressed) {
+        next_state = State::PREP;
+      }
+      break;
   }
 
   if (next_state != current_state || renter_state) {
@@ -275,7 +289,7 @@ State run_state_machine(State current_state) {
 
       case State::STOP:
         Serial.println("STOP");
-        stop_column();
+        stop_column(last_move_direction);
         break;
 
       case State::IDLE:
@@ -286,6 +300,11 @@ State run_state_machine(State current_state) {
       case State::RESUME:
         Serial.println("RESUME");
         enable_psu();
+        break;
+
+      case State::DEAD:
+        Serial.println("DEAD");
+        disable_psu();
         break;
 
       default:
@@ -368,6 +387,7 @@ bool is_projector_on() {
 
   const auto now = millis();
   const auto current = read_current_sensor_value();
+
   const auto threshold =
       CURRENT_PROJECTOR_ON - last_projector_state ? CURRENT_HYSTERESIS : 0.0f;
 
@@ -390,62 +410,57 @@ bool is_projector_on() {
   return last_projector_state == ProjectorState::ON;
 }
 
-void init_modbus() {
-  pinMode(MAX485_RE, OUTPUT);
-  pinMode(MAX485_DE, OUTPUT);
-  digitalWrite(MAX485_RE, 0);
-  digitalWrite(MAX485_DE, 0);
+void init_motor_ctrl() {
+  // Set output pins to high impedance
+  pinMode(LIMIT_UP_PIN, INPUT);
+  pinMode(LIMIT_DOWN_PIN, INPUT);
 
-  modbus_serial.begin(9600);
-
-  node.begin(SLAVE_ID, modbus_serial);
-  node.preTransmission(modbus_pre_tx);
-  node.postTransmission(modbus_post_tx);
+  digitalWrite(MOVE_UP_PIN, LOW);
+  digitalWrite(MOVE_DOWN_PIN, LOW);
+  digitalWrite(MOVE_STOP_PIN, LOW);
+  pinMode(MOVE_UP_PIN, OUTPUT);
+  pinMode(MOVE_DOWN_PIN, OUTPUT);
+  pinMode(MOVE_STOP_PIN, OUTPUT);
 }
 
-void modbus_pre_tx() {
-  digitalWrite(MAX485_RE, 1);
-  digitalWrite(MAX485_DE, 1);
+void lower_column() {
+  // Set MOVE_DOWN_PIN high for 100ms
+  digitalWrite(MOVE_DOWN_PIN, HIGH);
+  delay(200);
+  digitalWrite(MOVE_DOWN_PIN, LOW);
 }
 
-void modbus_post_tx() {
-  digitalWrite(MAX485_RE, 0);
-  digitalWrite(MAX485_DE, 0);
+void raise_column() {
+  // Set MOVE_UP_PIN high for 100ms
+  digitalWrite(MOVE_UP_PIN, HIGH);
+  delay(200);
+  digitalWrite(MOVE_UP_PIN, LOW);
 }
 
-void modbus_send_command(uint16_t address, uint16_t value) {
-  uint8_t result = node.writeSingleRegister(address, value);
-
-  if (result != node.ku8MBSuccess) {
-    Serial.println("Failed to send command");
-  }
+void stop_column(MoveDirection /* moveDirection */) {
+  // Set MOVE_STOP_PIN high for 100ms
+  digitalWrite(MOVE_STOP_PIN, HIGH);
+  delay(200);
+  digitalWrite(MOVE_STOP_PIN, LOW);
 }
-
-void lower_column() { modbus_send_command(0x0003, 0x0001); }
-void raise_column() { modbus_send_command(0x0001, 0x0001); }
-void stop_column() { modbus_send_command(0x0002, 0x0001); }
 
 // Get the lift state
 LiftState get_lift_state() {
+  // If the relay is off, the lift is in an unknown state
   if (digitalRead(RELAY_PIN) == LOW) {
     return LiftState::UNKNOWN;
   }
 
-  uint8_t result = node.readHoldingRegisters(0x0001, 2);
-  if (result == node.ku8MBSuccess) {
-    auto lower_limit = node.getResponseBuffer(0) & 0xff;
-    auto upper_limit = node.getResponseBuffer(1) & 0xff;
+  // Read input pins, which are pulled to GND when limits are reached
+  const auto limit_up = digitalRead(LIMIT_UP_PIN);
+  const auto limit_down = digitalRead(LIMIT_DOWN_PIN);
 
-    switch (lower_limit << 1 | upper_limit) {
-      case 0b10:
-        return LiftState::DOWN;
-      case 0b11:
-        return LiftState::INTER;
-      case 0b01:
-        return LiftState::UP;
-      default:
-        return LiftState::UNKNOWN;
-    }
+  if (limit_up == LOW && limit_down == HIGH) {
+    return LiftState::UP;
+  } else if (limit_up == HIGH && limit_down == LOW) {
+    return LiftState::DOWN;
+  } else if (limit_up == HIGH && limit_down == HIGH) {
+    return LiftState::INTER;
   } else {
     return LiftState::UNKNOWN;
   }
