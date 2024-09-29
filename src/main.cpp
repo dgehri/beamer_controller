@@ -58,18 +58,17 @@ State run_state_machine(State state);
 
 const unsigned long BUTTON_DEBOUNCE_DELAY = 20u;      // ms
 const unsigned long BUTTON_MAX_PRESS_DURATION = 200;  // ms
-const unsigned long BUTTON_REPEAT_DELAY = 1000u;      // ms
+const unsigned long BUTTON_REPEAT_DELAY = 500u;       // ms
 const unsigned long PROJECTOR_DEBOUNCE_DELAY = 500u;  // ms
 const unsigned long LIFT_LOWER_DELAY = 15000u;        // ms
 const unsigned long IDLE_TIMEOUT = 60000u;            // ms
 const unsigned long RESUME_TIMEOUT = 100u;            // ms
 const unsigned long MAX_MOVE_TIME = 1000u;            // ms
-const unsigned long MAX_PREP_TIME =
-    10000u;  // ms (max time before considering controller is dead)
-const auto CURRENT_SENSOR_AMP_PER_VOLT = 20.0f;  // A/V
-const auto VREF = 3.3f;                          // V
-const auto CURRENT_PROJECTOR_ON = 0.06f;         // A
-const auto CURRENT_HYSTERESIS = 0.03f;           // A
+const unsigned long MAX_PREP_TIME = 10000u;           // ms
+const auto CURRENT_SENSOR_AMP_PER_VOLT = 20.0f;       // A/V
+const auto VREF = 3.3f;                               // V
+const auto CURRENT_PROJECTOR_ON = 0.06f;              // A
+const auto CURRENT_HYSTERESIS = 0.03f;                // A
 
 bool last_button_state = false;
 
